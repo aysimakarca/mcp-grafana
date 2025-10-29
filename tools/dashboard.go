@@ -653,11 +653,17 @@ type GetFederationDataMigrationParams struct {
 // FederationMigrationErrorSummary provides a summary of errors for a specific migration
 type FederationMigrationErrorSummary struct {
 	MigrationID      string              `json:"migrationId"`
+	Dashboards       []DashboardAnalysis `json:"dashboards"`
+	TotalDashboards  int                 `json:"totalDashboards"`
+	TotalErrorPanels int                 `json:"totalErrorPanels"`
+	Summary          string              `json:"summary"`
+}
+
+type DashboardAnalysis struct {
 	DashboardUID     string              `json:"dashboardUid"`
 	DashboardTitle   string              `json:"dashboardTitle"`
 	ErrorPanels      []ErrorPanelSummary `json:"errorPanels"`
 	TotalErrorPanels int                 `json:"totalErrorPanels"`
-	Summary          string              `json:"summary"`
 }
 
 type ErrorPanelSummary struct {
@@ -669,82 +675,105 @@ type ErrorPanelSummary struct {
 
 // getFederationDataMigration analyzes errors for a specific federation data migration
 func getFederationDataMigration(ctx context.Context, args GetFederationDataMigrationParams) (*FederationMigrationErrorSummary, error) {
-	// Search for the dashboard by name
+	// Search for all dashboards containing "Cloudberry Data Migration"
 	searchResults, err := searchDashboards(ctx, SearchDashboardsParams{Query: "Cloudberry Data Migration"})
 	if err != nil {
-		return nil, fmt.Errorf("failed to search for Cloudberry Data Migration dashboard: %w", err)
+		return nil, fmt.Errorf("failed to search for Cloudberry Data Migration dashboards: %w", err)
 	}
 
 	if len(searchResults) == 0 {
 		return nil, fmt.Errorf("no dashboard found with name containing 'Cloudberry Data Migration'")
 	}
 
-	// Use the first matching dashboard
-	dashboardUID := searchResults[0].UID
-	if dashboardUID == "" {
-		return nil, fmt.Errorf("dashboard UID is empty in search results")
-	}
+	// Analyze all matching dashboards
+	var dashboardAnalyses []DashboardAnalysis
+	totalErrorPanels := 0
 
-	// Get the full dashboard details
-	dashboard, err := getDashboardByUID(ctx, GetDashboardByUIDParams{UID: dashboardUID})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get Cloudberry Data Migration dashboard (UID: %s): %w", dashboardUID, err)
-	}
+	for _, result := range searchResults {
+		if result.UID == "" {
+			continue
+		}
 
-	db, ok := dashboard.Dashboard.(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("dashboard is not a JSON object")
-	}
+		// Get the full dashboard details
+		dashboard, err := getDashboardByUID(ctx, GetDashboardByUIDParams{UID: result.UID})
+		if err != nil {
+			// Log error but continue with other dashboards
+			continue
+		}
 
-	// Extract dashboard title
-	dashboardTitle := safeString(db, "title")
+		db, ok := dashboard.Dashboard.(map[string]interface{})
+		if !ok {
+			continue
+		}
 
-	// Analyze panels for error-related information
-	var errorPanels []ErrorPanelSummary
-	if panels := safeArray(db, "panels"); panels != nil {
-		for _, p := range panels {
-			if panelObj, ok := p.(map[string]interface{}); ok {
-				panelTitle := safeString(panelObj, "title")
-				panelType := safeString(panelObj, "type")
-				panelDesc := safeString(panelObj, "description")
+		// Extract dashboard title
+		dashboardTitle := safeString(db, "title")
 
-				// Check if panel is related to errors (by title or description)
-				if strings.Contains(strings.ToLower(panelTitle), "error") ||
-					strings.Contains(strings.ToLower(panelDesc), "error") {
-					errorPanels = append(errorPanels, ErrorPanelSummary{
-						PanelID:     safeInt(panelObj, "id"),
-						PanelTitle:  panelTitle,
-						PanelType:   panelType,
-						Description: panelDesc,
-					})
+		// Analyze panels for error-related information
+		var errorPanels []ErrorPanelSummary
+		if panels := safeArray(db, "panels"); panels != nil {
+			for _, p := range panels {
+				if panelObj, ok := p.(map[string]interface{}); ok {
+					panelTitle := safeString(panelObj, "title")
+					panelType := safeString(panelObj, "type")
+					panelDesc := safeString(panelObj, "description")
+
+					// Check if panel is related to errors or warnings (by title or description)
+					if strings.Contains(strings.ToLower(panelTitle), "error") ||
+						strings.Contains(strings.ToLower(panelDesc), "error") ||
+						strings.Contains(strings.ToLower(panelTitle), "warning") ||
+						strings.Contains(strings.ToLower(panelDesc), "warning") {
+						errorPanels = append(errorPanels, ErrorPanelSummary{
+							PanelID:     safeInt(panelObj, "id"),
+							PanelTitle:  panelTitle,
+							PanelType:   panelType,
+							Description: panelDesc,
+						})
+					}
 				}
 			}
 		}
+
+		dashboardAnalyses = append(dashboardAnalyses, DashboardAnalysis{
+			DashboardUID:     result.UID,
+			DashboardTitle:   dashboardTitle,
+			ErrorPanels:      errorPanels,
+			TotalErrorPanels: len(errorPanels),
+		})
+		totalErrorPanels += len(errorPanels)
 	}
 
 	// Create summary
-	summary := fmt.Sprintf("Analyzed dashboard '%s' (UID: %s) for migration ID: %s\n",
-		dashboardTitle, dashboardUID, args.MigrationID)
-	summary += fmt.Sprintf("Found %d error-related panels", len(errorPanels))
+	summary := fmt.Sprintf("Analyzed %d dashboard(s) containing 'Cloudberry Data Migration' for migration ID: %s\n\n",
+		len(dashboardAnalyses), args.MigrationID)
 
-	if len(errorPanels) > 0 {
-		summary += ":\n\n"
-		for _, panel := range errorPanels {
-			summary += fmt.Sprintf("- %s (Panel ID: %d, Type: %s)\n", panel.PanelTitle, panel.PanelID, panel.PanelType)
-			if panel.Description != "" {
-				summary += fmt.Sprintf("  Description: %s\n", panel.Description)
+	for _, analysis := range dashboardAnalyses {
+		summary += fmt.Sprintf("Dashboard: '%s' (UID: %s)\n", analysis.DashboardTitle, analysis.DashboardUID)
+		summary += fmt.Sprintf("  Found %d error/warning-related panels", analysis.TotalErrorPanels)
+
+		if analysis.TotalErrorPanels > 0 {
+			summary += ":\n"
+			for _, panel := range analysis.ErrorPanels {
+				summary += fmt.Sprintf("  - %s (Panel ID: %d, Type: %s)\n", panel.PanelTitle, panel.PanelID, panel.PanelType)
+				if panel.Description != "" {
+					summary += fmt.Sprintf("    Description: %s\n", panel.Description)
+				}
 			}
+		} else {
+			summary += "\n"
 		}
-	} else {
-		summary += ".\n\nNo error-specific panels found. You may need to query the dashboard panels directly for migration-specific data."
+		summary += "\n"
+	}
+
+	if totalErrorPanels == 0 {
+		summary += "No error or warning-specific panels found across all dashboards. You may need to query the dashboard panels directly for migration-specific data."
 	}
 
 	return &FederationMigrationErrorSummary{
 		MigrationID:      args.MigrationID,
-		DashboardUID:     dashboardUID,
-		DashboardTitle:   dashboardTitle,
-		ErrorPanels:      errorPanels,
-		TotalErrorPanels: len(errorPanels),
+		Dashboards:       dashboardAnalyses,
+		TotalDashboards:  len(dashboardAnalyses),
+		TotalErrorPanels: totalErrorPanels,
 		Summary:          summary,
 	}, nil
 }
