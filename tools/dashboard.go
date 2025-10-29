@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/PaesslerAG/gval"
 	"github.com/PaesslerAG/jsonpath"
@@ -644,10 +645,124 @@ func extractVariableSummary(variable map[string]interface{}) VariableSummary {
 	}
 }
 
+// GetFederationDataMigrationParams defines parameters for analyzing federation data migration
+type GetFederationDataMigrationParams struct {
+	MigrationID string `json:"migrationId" jsonschema:"required,description=The UUID of the migration to analyze"`
+}
+
+// FederationMigrationErrorSummary provides a summary of errors for a specific migration
+type FederationMigrationErrorSummary struct {
+	MigrationID      string              `json:"migrationId"`
+	DashboardUID     string              `json:"dashboardUid"`
+	DashboardTitle   string              `json:"dashboardTitle"`
+	ErrorPanels      []ErrorPanelSummary `json:"errorPanels"`
+	TotalErrorPanels int                 `json:"totalErrorPanels"`
+	Summary          string              `json:"summary"`
+}
+
+type ErrorPanelSummary struct {
+	PanelID     int    `json:"panelId"`
+	PanelTitle  string `json:"panelTitle"`
+	PanelType   string `json:"panelType"`
+	Description string `json:"description"`
+}
+
+// getFederationDataMigration analyzes errors for a specific federation data migration
+func getFederationDataMigration(ctx context.Context, args GetFederationDataMigrationParams) (*FederationMigrationErrorSummary, error) {
+	// Search for the dashboard by name
+	searchResults, err := searchDashboards(ctx, SearchDashboardsParams{Query: "Cloudberry Data Migration"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to search for Cloudberry Data Migration dashboard: %w", err)
+	}
+
+	if len(searchResults) == 0 {
+		return nil, fmt.Errorf("no dashboard found with name containing 'Cloudberry Data Migration'")
+	}
+
+	// Use the first matching dashboard
+	dashboardUID := searchResults[0].UID
+	if dashboardUID == "" {
+		return nil, fmt.Errorf("dashboard UID is empty in search results")
+	}
+
+	// Get the full dashboard details
+	dashboard, err := getDashboardByUID(ctx, GetDashboardByUIDParams{UID: dashboardUID})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get Cloudberry Data Migration dashboard (UID: %s): %w", dashboardUID, err)
+	}
+
+	db, ok := dashboard.Dashboard.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("dashboard is not a JSON object")
+	}
+
+	// Extract dashboard title
+	dashboardTitle := safeString(db, "title")
+
+	// Analyze panels for error-related information
+	var errorPanels []ErrorPanelSummary
+	if panels := safeArray(db, "panels"); panels != nil {
+		for _, p := range panels {
+			if panelObj, ok := p.(map[string]interface{}); ok {
+				panelTitle := safeString(panelObj, "title")
+				panelType := safeString(panelObj, "type")
+				panelDesc := safeString(panelObj, "description")
+
+				// Check if panel is related to errors (by title or description)
+				if strings.Contains(strings.ToLower(panelTitle), "error") ||
+					strings.Contains(strings.ToLower(panelDesc), "error") {
+					errorPanels = append(errorPanels, ErrorPanelSummary{
+						PanelID:     safeInt(panelObj, "id"),
+						PanelTitle:  panelTitle,
+						PanelType:   panelType,
+						Description: panelDesc,
+					})
+				}
+			}
+		}
+	}
+
+	// Create summary
+	summary := fmt.Sprintf("Analyzed dashboard '%s' (UID: %s) for migration ID: %s\n",
+		dashboardTitle, dashboardUID, args.MigrationID)
+	summary += fmt.Sprintf("Found %d error-related panels", len(errorPanels))
+
+	if len(errorPanels) > 0 {
+		summary += ":\n\n"
+		for _, panel := range errorPanels {
+			summary += fmt.Sprintf("- %s (Panel ID: %d, Type: %s)\n", panel.PanelTitle, panel.PanelID, panel.PanelType)
+			if panel.Description != "" {
+				summary += fmt.Sprintf("  Description: %s\n", panel.Description)
+			}
+		}
+	} else {
+		summary += ".\n\nNo error-specific panels found. You may need to query the dashboard panels directly for migration-specific data."
+	}
+
+	return &FederationMigrationErrorSummary{
+		MigrationID:      args.MigrationID,
+		DashboardUID:     dashboardUID,
+		DashboardTitle:   dashboardTitle,
+		ErrorPanels:      errorPanels,
+		TotalErrorPanels: len(errorPanels),
+		Summary:          summary,
+	}, nil
+}
+
+var GetFederationDataMigration = mcpgrafana.MustTool(
+	"get_federation_data_migration",
+	"Analyzes errors for a specific federation data migration by querying the 'Cloudberry Data Migration (aka Federation Phase 4)' dashboard. Provide a migration UUID to get a summary of error-related panels and information for that migration.",
+	getFederationDataMigration,
+	mcp.WithTitleAnnotation("Get federation data migration errors"),
+	mcp.WithIdempotentHintAnnotation(true),
+	mcp.WithReadOnlyHintAnnotation(true),
+)
+
 func AddDashboardTools(mcp *server.MCPServer) {
 	GetDashboardByUID.Register(mcp)
 	UpdateDashboard.Register(mcp)
 	GetDashboardPanelQueries.Register(mcp)
 	GetDashboardProperty.Register(mcp)
 	GetDashboardSummary.Register(mcp)
+	GetFederationDataMigration.Register(mcp)
 }
