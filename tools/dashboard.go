@@ -1,12 +1,16 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/PaesslerAG/gval"
 	"github.com/PaesslerAG/jsonpath"
@@ -645,6 +649,155 @@ func extractVariableSummary(variable map[string]interface{}) VariableSummary {
 	}
 }
 
+// ElasticsearchLogEntry represents a log entry from Elasticsearch
+type ElasticsearchLogEntry struct {
+	Timestamp  string `json:"timestamp"`
+	Message    string `json:"message"`
+	Level      string `json:"level"`
+	Phase      string `json:"phase,omitempty"`
+	Feature    string `json:"feature,omitempty"`
+	Workstream string `json:"workstream,omitempty"`
+	TrackingID string `json:"trackingId,omitempty"`
+}
+
+// queryElasticsearchLogs queries Elasticsearch for federation migration logs
+func queryElasticsearchLogs(ctx context.Context, datasourceUID, migrationID, level string, size int) ([]ElasticsearchLogEntry, error) {
+	// Get datasource details
+	_, err := getDatasourceByUID(ctx, GetDatasourceByUIDParams{UID: datasourceUID})
+	if err != nil {
+		return nil, fmt.Errorf("getting datasource: %w", err)
+	}
+
+	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
+	baseURL := fmt.Sprintf("%s/api/datasources/proxy/uid/%s", strings.TrimRight(cfg.URL, "/"), datasourceUID)
+
+	// Create HTTP client with auth
+	var transport = http.DefaultTransport
+	if tlsConfig := cfg.TLSConfig; tlsConfig != nil {
+		transport, err = tlsConfig.HTTPTransport(transport.(*http.Transport))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create custom transport: %w", err)
+		}
+	}
+
+	transport = NewAuthRoundTripper(transport, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth)
+	transport = mcpgrafana.NewOrgIDRoundTripper(transport, cfg.OrgID)
+
+	client := &http.Client{
+		Transport: mcpgrafana.NewUserAgentTransport(transport),
+	}
+
+	// Build Elasticsearch query
+	query := map[string]interface{}{
+		"size": size,
+		"sort": []map[string]interface{}{
+			{"@timestamp": map[string]string{"order": "desc"}},
+		},
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"must": []map[string]interface{}{
+					{
+						"term": map[string]interface{}{
+							"fields.CLOUDBERRY_FEMO_MIGRATION_ID": migrationID,
+						},
+					},
+					{
+						"term": map[string]interface{}{
+							"fields.level": level,
+						},
+					},
+					{
+						"range": map[string]interface{}{
+							"@timestamp": map[string]interface{}{
+								"gte": "now-7d",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	queryJSON, err := json.Marshal(query)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling query: %w", err)
+	}
+
+	// Make request
+	url := baseURL + "/_search"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(queryJSON))
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("executing request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("elasticsearch returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	// Parse response
+	var esResp struct {
+		Hits struct {
+			Hits []struct {
+				Source map[string]interface{} `json:"_source"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+
+	if err := json.Unmarshal(body, &esResp); err != nil {
+		return nil, fmt.Errorf("unmarshalling response: %w", err)
+	}
+
+	// Convert to log entries
+	var entries []ElasticsearchLogEntry
+	for _, hit := range esResp.Hits.Hits {
+		entry := ElasticsearchLogEntry{}
+
+		if ts, ok := hit.Source["@timestamp"].(string); ok {
+			entry.Timestamp = ts
+		}
+		if msg, ok := hit.Source["message"].(string); ok {
+			entry.Message = msg
+		}
+
+		// Extract fields
+		if fields, ok := hit.Source["fields"].(map[string]interface{}); ok {
+			if level, ok := fields["level"].(string); ok {
+				entry.Level = level
+			}
+			if phase, ok := fields["CLOUDBERRY_MIGRATION_PHASE"].(string); ok {
+				entry.Phase = phase
+			}
+			if feature, ok := fields["CLOUDBERRY_MIGRATION_FEATURE"].(string); ok {
+				entry.Feature = feature
+			}
+			if ws, ok := fields["FEMO_WORKSTREAM"].(string); ok {
+				entry.Workstream = ws
+			}
+			if tid, ok := fields["WEBEX_TRACKINGID"].(string); ok {
+				entry.TrackingID = tid
+			}
+		}
+
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
+}
+
 // GetFederationDataMigrationParams defines parameters for analyzing federation data migration
 type GetFederationDataMigrationParams struct {
 	MigrationID string `json:"migrationId" jsonschema:"required,description=The UUID of the migration to analyze"`
@@ -652,11 +805,15 @@ type GetFederationDataMigrationParams struct {
 
 // FederationMigrationErrorSummary provides a summary of errors for a specific migration
 type FederationMigrationErrorSummary struct {
-	MigrationID      string              `json:"migrationId"`
-	Dashboards       []DashboardAnalysis `json:"dashboards"`
-	TotalDashboards  int                 `json:"totalDashboards"`
-	TotalErrorPanels int                 `json:"totalErrorPanels"`
-	Summary          string              `json:"summary"`
+	MigrationID      string                  `json:"migrationId"`
+	Dashboards       []DashboardAnalysis     `json:"dashboards"`
+	TotalDashboards  int                     `json:"totalDashboards"`
+	TotalErrorPanels int                     `json:"totalErrorPanels"`
+	ErrorLogs        []ElasticsearchLogEntry `json:"errorLogs,omitempty"`
+	WarningLogs      []ElasticsearchLogEntry `json:"warningLogs,omitempty"`
+	TotalErrors      int                     `json:"totalErrors"`
+	TotalWarnings    int                     `json:"totalWarnings"`
+	Summary          string                  `json:"summary"`
 }
 
 type DashboardAnalysis struct {
@@ -667,10 +824,14 @@ type DashboardAnalysis struct {
 }
 
 type ErrorPanelSummary struct {
-	PanelID     int    `json:"panelId"`
-	PanelTitle  string `json:"panelTitle"`
-	PanelType   string `json:"panelType"`
-	Description string `json:"description"`
+	PanelID     int         `json:"panelId"`
+	PanelTitle  string      `json:"panelTitle"`
+	PanelType   string      `json:"panelType"`
+	Description string      `json:"description"`
+	Data        interface{} `json:"data,omitempty"`       // Actual panel data
+	Value       interface{} `json:"value,omitempty"`      // For stat panels
+	RowCount    int         `json:"rowCount,omitempty"`   // For table panels
+	QueryError  string      `json:"queryError,omitempty"` // If query failed
 }
 
 // getFederationDataMigration analyzes errors for a specific federation data migration
@@ -688,6 +849,8 @@ func getFederationDataMigration(ctx context.Context, args GetFederationDataMigra
 	// Analyze all matching dashboards
 	var dashboardAnalyses []DashboardAnalysis
 	totalErrorPanels := 0
+	totalErrors := 0
+	totalWarnings := 0
 
 	for _, result := range searchResults {
 		if result.UID == "" {
@@ -706,8 +869,9 @@ func getFederationDataMigration(ctx context.Context, args GetFederationDataMigra
 			continue
 		}
 
-		// Extract dashboard title
+		// Extract dashboard title and variables
 		dashboardTitle := safeString(db, "title")
+		variables := extractDashboardVariables(db)
 
 		// Analyze panels for error-related information
 		var errorPanels []ErrorPanelSummary
@@ -723,12 +887,36 @@ func getFederationDataMigration(ctx context.Context, args GetFederationDataMigra
 						strings.Contains(strings.ToLower(panelDesc), "error") ||
 						strings.Contains(strings.ToLower(panelTitle), "warning") ||
 						strings.Contains(strings.ToLower(panelDesc), "warning") {
-						errorPanels = append(errorPanels, ErrorPanelSummary{
+
+						panelSummary := ErrorPanelSummary{
 							PanelID:     safeInt(panelObj, "id"),
 							PanelTitle:  panelTitle,
 							PanelType:   panelType,
 							Description: panelDesc,
-						})
+						}
+
+						// Try to execute panel queries to get actual data
+						if targets := safeArray(panelObj, "targets"); targets != nil && len(targets) > 0 {
+							data, value, rowCount, queryErr := executePanelQuery(ctx, panelObj, args.MigrationID, variables)
+							if queryErr != nil {
+								panelSummary.QueryError = queryErr.Error()
+							} else {
+								panelSummary.Data = data
+								panelSummary.Value = value
+								panelSummary.RowCount = rowCount
+
+								// Try to extract numeric value for error/warning counts
+								if numValue, ok := value.(float64); ok {
+									if strings.Contains(strings.ToLower(panelTitle), "error") {
+										totalErrors += int(numValue)
+									} else if strings.Contains(strings.ToLower(panelTitle), "warning") {
+										totalWarnings += int(numValue)
+									}
+								}
+							}
+						}
+
+						errorPanels = append(errorPanels, panelSummary)
 					}
 				}
 			}
@@ -774,8 +962,186 @@ func getFederationDataMigration(ctx context.Context, args GetFederationDataMigra
 		Dashboards:       dashboardAnalyses,
 		TotalDashboards:  len(dashboardAnalyses),
 		TotalErrorPanels: totalErrorPanels,
+		TotalErrors:      totalErrors,
+		TotalWarnings:    totalWarnings,
 		Summary:          summary,
 	}, nil
+}
+
+// extractDashboardVariables extracts variable definitions from dashboard
+func extractDashboardVariables(db map[string]interface{}) map[string]string {
+	variables := make(map[string]string)
+	templating := safeObject(db, "templating")
+	if templating == nil {
+		return variables
+	}
+
+	list := safeArray(templating, "list")
+	if list == nil {
+		return variables
+	}
+
+	for _, v := range list {
+		if varObj, ok := v.(map[string]interface{}); ok {
+			name := safeString(varObj, "name")
+			if name != "" {
+				// Store variable name for reference
+				variables[name] = name
+			}
+		}
+	}
+
+	return variables
+}
+
+// executePanelQuery executes a panel's query with the migration ID filter
+func executePanelQuery(ctx context.Context, panel map[string]interface{}, migrationID string, variables map[string]string) (data interface{}, value interface{}, rowCount int, err error) {
+	targets := safeArray(panel, "targets")
+	if len(targets) == 0 {
+		return nil, nil, 0, fmt.Errorf("no targets found")
+	}
+
+	// Get the first target (most panels have one main query)
+	target, ok := targets[0].(map[string]interface{})
+	if !ok {
+		return nil, nil, 0, fmt.Errorf("invalid target format")
+	}
+
+	// Extract datasource
+	datasourceObj := safeObject(target, "datasource")
+	if datasourceObj == nil {
+		return nil, nil, 0, fmt.Errorf("no datasource found")
+	}
+
+	datasourceUID := safeString(datasourceObj, "uid")
+	datasourceType := safeString(datasourceObj, "type")
+
+	// Check if datasource UID is a variable reference
+	if strings.HasPrefix(datasourceUID, "$") {
+		return nil, nil, 0, fmt.Errorf("datasource is a template variable: %s", datasourceUID)
+	}
+
+	// Handle different datasource types
+	switch datasourceType {
+	case "loki":
+		return executeLokiPanelQuery(ctx, target, datasourceUID, migrationID)
+	case "prometheus":
+		return executePrometheusPanelQuery(ctx, target, datasourceUID, migrationID)
+	default:
+		return nil, nil, 0, fmt.Errorf("unsupported datasource type: %s", datasourceType)
+	}
+}
+
+// executeLokiPanelQuery executes a Loki query with migration ID filter
+func executeLokiPanelQuery(ctx context.Context, target map[string]interface{}, datasourceUID, migrationID string) (data interface{}, value interface{}, rowCount int, err error) {
+	// Extract the LogQL query
+	expr := safeString(target, "expr")
+	if expr == "" {
+		return nil, nil, 0, fmt.Errorf("no expr found in target")
+	}
+
+	// Add migration ID filter to the query
+	// This is a simple approach - inject the migration_id label filter
+	modifiedExpr := injectMigrationIDFilter(expr, migrationID)
+
+	// Execute the query using queryLokiLogs
+	// Use last 3 days as default time range
+	startTime := time.Now().Add(-72 * time.Hour).Format(time.RFC3339)
+	endTime := time.Now().Format(time.RFC3339)
+
+	logs, err := queryLokiLogs(ctx, QueryLokiLogsParams{
+		DatasourceUID: datasourceUID,
+		LogQL:         modifiedExpr,
+		StartRfc3339:  startTime,
+		EndRfc3339:    endTime,
+		Limit:         100,
+		Direction:     "backward",
+	})
+
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("executing loki query: %w", err)
+	}
+
+	// Return the logs and count
+	return logs, float64(len(logs)), len(logs), nil
+}
+
+// executePrometheusPanelQuery executes a Prometheus query with migration ID filter
+func executePrometheusPanelQuery(ctx context.Context, target map[string]interface{}, datasourceUID, migrationID string) (data interface{}, value interface{}, rowCount int, err error) {
+	// Extract the PromQL query
+	expr := safeString(target, "expr")
+	if expr == "" {
+		return nil, nil, 0, fmt.Errorf("no expr found in target")
+	}
+
+	// Add migration ID filter to the query
+	modifiedExpr := injectMigrationIDFilter(expr, migrationID)
+
+	// Execute instant query
+	result, err := queryPrometheus(ctx, QueryPrometheusParams{
+		DatasourceUID: datasourceUID,
+		Expr:          modifiedExpr,
+		QueryType:     "instant",
+		StartTime:     "now",
+	})
+
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("executing prometheus query: %w", err)
+	}
+
+	// Extract value from result
+	if result != nil && len(result) > 0 {
+		if firstResult, ok := result[0].(map[string]interface{}); ok {
+			if val := safeFloat(firstResult, "value"); val != 0 {
+				return result, val, 1, nil
+			}
+		}
+	}
+
+	return result, 0.0, len(result), nil
+}
+
+// injectMigrationIDFilter adds migration_id filter to a query
+func injectMigrationIDFilter(query, migrationID string) string {
+	// For Loki queries: {app="foo"} -> {app="foo", migration_id="xxx"}
+	// For Prometheus queries: metric{label="value"} -> metric{label="value", migration_id="xxx"}
+
+	// Simple approach: look for the label matcher and inject the migration_id
+	if strings.Contains(query, "{") {
+		// Find the first closing brace
+		idx := strings.Index(query, "}")
+		if idx > 0 {
+			// Check if there are already labels
+			labelSection := query[strings.Index(query, "{"):idx]
+			if strings.Contains(labelSection, "=") {
+				// Add comma before migration_id
+				return query[:idx] + fmt.Sprintf(`, migration_id="%s"`, migrationID) + query[idx:]
+			} else {
+				// No existing labels, just add migration_id
+				return query[:idx] + fmt.Sprintf(`migration_id="%s"`, migrationID) + query[idx:]
+			}
+		}
+	}
+
+	// If no label matchers found, wrap the query
+	return fmt.Sprintf(`{migration_id="%s"} | %s`, migrationID, query)
+}
+
+// safeFloat safely extracts a float64 value from a map
+func safeFloat(data map[string]interface{}, key string) float64 {
+	if val, ok := data[key]; ok {
+		switch v := val.(type) {
+		case float64:
+			return v
+		case int:
+			return float64(v)
+		case string:
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				return f
+			}
+		}
+	}
+	return 0
 }
 
 var GetFederationDataMigration = mcpgrafana.MustTool(
